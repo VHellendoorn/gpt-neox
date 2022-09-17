@@ -79,6 +79,12 @@ def apply_rotary_pos_emb_torch(
 
 
 class AliBi(torch.nn.Module):
+
+    # Declare these as static variables to avoid creating copies for every model layer.
+    # This is especially memory-efficient for deep models with long inputs.
+    cached_matrix = None
+    cached_seq_len = None
+
     def __init__(self, num_heads, mp_size=1, mp_rank=1):
         super().__init__()
         # megatron splits across heads, so we need to make sure each
@@ -88,8 +94,6 @@ class AliBi(torch.nn.Module):
         self.mp_rank = mp_rank
         self.num_heads = num_heads
         self.slice_size = num_heads // mp_size
-        self.cached_matrix = None
-        self.cached_seq_len = None
         slopes = torch.Tensor(self._get_slopes(num_heads))[
             mp_rank * self.slice_size : (mp_rank + 1) * self.slice_size
         ]
@@ -126,23 +130,25 @@ class AliBi(torch.nn.Module):
         # Initialize the AliBi matrix to match the first provided key length; grow it exponentially
         # afterwards if longer inputs are provided. This is important for inference, where we will
         # encounter progressively longer samples; it should have no effect at training time.
-        if self.cached_seq_len is not None and self.cached_seq_len >= seq_len_k:
-            a = self.cached_matrix
+        if AliBi.cached_seq_len is not None and AliBi.cached_seq_len >= seq_len_k:
+            a = AliBi.cached_matrix
         else:
-            target_seq_len = seq_len_k if self.cached_seq_len is None else self.cached_seq_len * 4
+            target_seq_len = seq_len_k if AliBi.cached_seq_len is None else AliBi.cached_seq_len * 4
             a = -torch.tril(
                 torch.arange(target_seq_len).view(target_seq_len, 1).repeat(1, target_seq_len)
                 + torch.arange(0, -target_seq_len, -1)
             )
             a = a.to(x.device).to(x.dtype)
-            slopes = self.slopes.to(a.device).to(a.dtype)
+            # If this is the first time we compute the AliBi matrix, move slopes to the same device and data type.
+            if AliBi.cached_matrix is None:
+                slopes = self.slopes.to(a.device).to(a.dtype)
             a = a * slopes.view(self.slopes.shape[0], 1, 1)
-            self.cached_seq_len = target_seq_len
-            self.cached_matrix = a
+            AliBi.cached_seq_len = target_seq_len
+            AliBi.cached_matrix = a
 
         # If the AliBi matrix is larger than the key length, clip it.
-        if self.cached_seq_len > seq_len_k:
-            a = self.cached_matrix[:, :seq_len_k, :seq_len_k]
+        if AliBi.cached_seq_len > seq_len_k:
+            a = AliBi.cached_matrix[:, :seq_len_k, :seq_len_k]
 
         if seq_len_q != seq_len_k:
             # In the train case x has dimensionality [b, np, sq, sk] with sq == sk
